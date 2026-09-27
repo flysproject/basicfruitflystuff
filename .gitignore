@@ -1,0 +1,19 @@
+# Thread-local preview state and logs
+.freebuff/
+
+# Generated atlas bake cache (rebakes in ~5 s from the NRRD volumes on first run)
+cache/
+
+# Runtime outputs
+exports/
+profiles/
+server.log
+server.log.err
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Node (only used for vendoring three.js)
+node_modules/

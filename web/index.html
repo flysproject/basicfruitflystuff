@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FlyBrain Sandbox - Drosophila neural simulation</title>
+<link rel="stylesheet" href="/css/app.css" />
+</head>
+<body>
+
+<!-- ── boot / loading ─────────────────────────────────────────────────── -->
+<div id="boot" class="boot">
+  <div class="boot-inner">
+    <div class="boot-mark">◈</div>
+    <h1>FlyBrain Sandbox</h1>
+    <p id="boot-status">Connecting to the simulation kernel…</p>
+    <div class="boot-bar"><span id="boot-fill"></span></div>
+    <ul id="boot-log" class="boot-log"></ul>
+  </div>
+</div>
+
+<!-- ── top bar ────────────────────────────────────────────────────────── -->
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">◈</span>
+    <div>
+      <strong>FlyBrain Sandbox</strong>
+      <span class="brand-sub">Drosophila neural &amp; endocrine simulation</span>
+    </div>
+  </div>
+
+  <div class="topbar-group" role="group" aria-label="Playback">
+    <button id="btn-play" class="chip chip-icon" title="Play / pause (Space)">❚❚</button>
+    <label class="chip chip-field" title="Simulation speed multiplier">
+      <span class="chip-label">×</span>
+      <input id="time-scale" type="range" min="0.1" max="3" step="0.1" value="1" />
+      <output id="time-scale-out">1.0</output>
+    </label>
+    <button id="btn-reset" class="chip" title="Reset the session">Reset</button>
+  </div>
+
+  <nav id="env-pills" class="topbar-group pills" aria-label="Environment"></nav>
+
+  <div class="topbar-group topbar-end">
+    <button id="btn-presets" class="chip chip-accent" title="One-click experiments (E)">Scenarios ▾</button>
+    <button id="btn-export" class="chip" title="Download telemetry">Export ▾</button>
+    <button id="btn-help" class="chip chip-icon" title="How to use this (H)">?</button>
+  </div>
+
+  <div id="menu-presets" class="menu" hidden></div>
+  <div id="menu-export" class="menu" hidden></div>
+</header>
+
+<main class="layout" id="layout">
+
+  <!-- ── left rail: the endocrine console ─────────────────────────────── -->
+  <aside class="rail rail-left" id="rail-left">
+    <button class="rail-collapse" data-target="rail-left" title="Collapse panel">‹</button>
+
+    <section class="panel">
+      <h2 class="panel-title">
+        Endocrine control
+        <span class="panel-hint" data-tip="Tonic sliders set the baseline each modulator relaxes toward. The simulation adds phasic spikes on top — feeding, threats and learning all fire transients, so the live bar moves even when you are not touching anything.">?</span>
+      </h2>
+      <div id="sliders" class="sliders"></div>
+      <div class="panel-actions">
+        <button id="btn-profile-save" class="chip chip-small">Save profile</button>
+        <label class="chip chip-small file">
+          Load profile
+          <input id="profile-file" type="file" accept="application/json" hidden />
+        </label>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2 class="panel-title">
+        Brain state
+        <span class="panel-hint" data-tip="Derived coefficients the fly's decision circuit actually reads. These are not displays: motor gain scales walking and wing-beat rate, persistence is how long a goal survives, reactivity sets the escape threshold.">?</span>
+      </h2>
+      <div id="derived" class="metrics"></div>
+    </section>
+
+    <section class="panel">
+      <h2 class="panel-title">
+        Physiology
+        <span class="panel-hint" data-tip="Slow variables. Hunger rises as energy falls; feeding refills energy. A fly starves over roughly ten simulated minutes, so hunger is a slow background drive rather than a per-second score.">?</span>
+      </h2>
+      <div id="vitals" class="metrics"></div>
+      <div class="daybar" title="Circadian phase. Drag the CLOCK slider or wait — the phase advances on its own.">
+        <span id="day-night" class="day-night">☀</span>
+        <div class="daybar-track"><span id="day-fill"></span></div>
+        <span class="day-label">24h</span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2 class="panel-title">
+        Genotype
+        <span class="panel-hint" data-tip="Each mutation disables exactly one subsystem, so you can watch that subsystem's contribution disappear: rutabaga removes acquisition, dunce removes retention, white halves visual gain, fruitless scrambles social drive.">?</span>
+      </h2>
+      <div id="mutations" class="toggles"></div>
+    </section>
+
+    <section class="panel">
+      <h2 class="panel-title">
+        Session
+        <span class="panel-hint" data-tip="Fly count switches between single-fly inspection and swarming. Audio synthesises the wing beat at its true frequency, which rises with octopamine and airspeed.">?</span>
+      </h2>
+      <div class="row">
+        <span class="row-label">Flies</span>
+        <input id="fly-count" type="range" min="1" max="10" step="1" value="1" />
+        <output id="fly-count-out">1</output>
+      </div>
+      <div class="row">
+        <span class="row-label">Day length</span>
+        <input id="day-length" type="range" min="30" max="600" step="30" value="180" />
+        <output id="day-length-out">180s</output>
+      </div>
+      <div class="panel-actions">
+        <button id="btn-audio" class="chip chip-small" aria-pressed="false">Audio: off</button>
+        <button id="btn-rois" class="chip chip-small" aria-pressed="true">ROI overlay: on</button>
+      </div>
+    </section>
+  </aside>
+
+  <!-- ── viewport ──────────────────────────────────────────────────────── -->
+  <section class="viewport" id="viewport">
+    <canvas id="gl"></canvas>
+
+    <!-- camera + status -->
+    <div class="hud hud-topleft">
+      <div id="camera-pills" class="pills pills-vertical" aria-label="Camera mode"></div>
+      <div id="mode-chip" class="mode-chip">
+        <span class="mode-dot"></span>
+        <span id="mode-name">REST</span>
+        <span id="mode-hint" class="mode-hint"></span>
+      </div>
+      <div id="status-chips" class="status-chips"></div>
+    </div>
+
+    <!-- brain -->
+    <div class="hud hud-topright" id="brain-hud">
+      <div class="hud-title">
+        Live connectome
+        <span class="panel-hint" data-tip="Raymarched from the real JRC2018Unisex volume supplied with this workspace. Region glow is driven by the router's activation this instant.">?</span>
+      </div>
+      <canvas id="brain" width="320" height="240"></canvas>
+      <div id="brain-source" class="hud-foot"></div>
+      <div id="brain-legend" class="legend"></div>
+    </div>
+
+    <!-- telemetry -->
+    <div class="hud hud-bottomright" id="telemetry-hud">
+      <div class="hud-title">
+        Telemetry
+        <span class="hud-sub">30 s window</span>
+        <button class="hud-toggle" data-collapse="telemetry-body" title="Collapse">–</button>
+      </div>
+      <div id="telemetry-body">
+        <canvas id="graphs" width="440" height="200"></canvas>
+        <div id="graph-legend" class="legend legend-inline"></div>
+      </div>
+    </div>
+
+    <!-- toolbelt -->
+    <div class="hud hud-bottomcenter">
+      <div id="toolbelt" class="toolbelt" role="toolbar" aria-label="Stimulus toolbelt"></div>
+    </div>
+
+    <!-- live readout + event ticker -->
+    <div class="hud hud-bottomleft">
+      <div id="region-readout" class="region-readout"></div>
+      <div class="ticker">
+        <span class="ticker-label">latest</span>
+        <span id="ticker-text">waiting for the kernel…</span>
+      </div>
+    </div>
+
+    <div id="drop-hint" class="drop-hint" hidden>Release to place</div>
+  </section>
+
+  <!-- ── right rail ───────────────────────────────────────────────────── -->
+  <aside class="rail rail-right" id="rail-right">
+    <button class="rail-collapse" data-target="rail-right" title="Collapse panel">›</button>
+
+    <section class="panel panel-grow">
+      <h2 class="panel-title">
+        Event log
+        <span class="panel-hint" data-tip="Every line is generated from simulation state, not scripted. Filter by channel to follow one system.">?</span>
+        <button id="btn-log-clear" class="panel-mini">clear</button>
+      </h2>
+      <div id="log-filters" class="filters"></div>
+      <ol id="log" class="log" aria-live="polite"></ol>
+    </section>
+
+    <section class="panel">
+      <h2 class="panel-title">
+        Memory
+        <span class="panel-hint" data-tip="Mushroom-body odour values. Innately neutral odours sit at zero; pair one with a shock or sugar and watch the bar move. Negative is avoidance.">?</span>
+      </h2>
+      <div class="learn-row">
+        <button id="btn-pair-shock" class="chip chip-small chip-danger">Pair + shock</button>
+        <button id="btn-pair-sugar" class="chip chip-small chip-good">Pair + sugar</button>
+        <button id="btn-forget" class="chip chip-small">Forget</button>
+      </div>
+      <div class="learn-row">
+        <label class="switch" title="Automatically pair whatever the fly currently smells with real shocks and real meals.">
+          <input id="chk-auto-condition" type="checkbox" />
+          <span>Auto-condition on real events</span>
+        </label>
+      </div>
+      <div id="memory" class="memory"></div>
+      <div id="memory-empty" class="empty">
+        No odour memories yet. Drop a scent, then press <b>Pair + shock</b> a few times —
+        if the CS is <b>Peppermint</b> the fly starts indifferent and learns to avoid it.
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2 class="panel-title">
+        Placed stimuli
+        <span class="panel-hint" data-tip="Everything in the arena right now. Drag an item to reposition it; the fly senses the change immediately.">?</span>
+      </h2>
+      <div id="stimulus-list" class="stim-list"></div>
+    </section>
+  </aside>
+</main>
+
+<footer class="statusbar">
+  <span id="stat-kernel">kernel —</span>
+  <span id="stat-step">step —</span>
+  <span id="stat-atlas">atlas —</span>
+  <span id="stat-conn">connectome —</span>
+  <span id="stat-net" class="stat-net">connecting…</span>
+</footer>
+
+<!-- ── first-run guide ────────────────────────────────────────────────── -->
+<div id="guide" class="modal" hidden>
+  <div class="modal-card">
+    <h2>Welcome to the FlyBrain Sandbox</h2>
+    <p class="modal-lede">
+      An autonomous <i>Drosophila</i> driven by simulated neuromodulators, a mushroom-body
+      memory and a region-level connectome — rendered inside a real environment you can
+      drop stimuli into.
+    </p>
+    <ol class="guide-steps">
+      <li><strong>Watch it decide.</strong> The fly is already running. The chip at the
+        top-left shows its current behaviour; the brain at the top-right shows which
+        neuropils are driving it, lit from the real JRC2018Unisex volume.</li>
+      <li><strong>Drop some food.</strong> Pick <b>Rotten banana</b> from the toolbelt and
+        click anywhere in the scene. The fly follows the odour plume — casting when it
+        loses the scent — and feeds once it arrives.</li>
+      <li><strong>Startle it.</strong> Drop a <b>Fly swatter</b>. Looming in the optic lobe
+        fires the giant fibre and you will see an escape takeoff in the event log.</li>
+      <li><strong>Change its brain.</strong> Drag the <b>Octopamine</b> slider and watch
+        flight readiness, wing-beat pitch and escape threshold all move together.</li>
+    </ol>
+    <p class="modal-foot">
+      Everything here is an approximation, and the app says which parts are which:
+      the volumes are real, the ROI ellipsoids are seeded from anatomy and snapped to
+      real tissue, and the connectome weights are qualitative unless you load your own.
+    </p>
+    <div class="modal-actions">
+      <button id="guide-close" class="chip chip-accent">Start exploring</button>
+      <button id="guide-tour" class="chip">Open the Pavlovian walkthrough</button>
+    </div>
+  </div>
+</div>
+
+<div id="tip" class="tip" hidden></div>
+<div id="toast" class="toast-stack"></div>
+
+<script type="module" src="/js/main.js"></script>
+</body>
+</html>

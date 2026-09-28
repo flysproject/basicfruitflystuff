@@ -1,0 +1,23 @@
+{
+  "name": "flybrain-sandbox",
+  "version": "1.0.0",
+  "private": true,
+  "description": "FlyBrain Sandbox — autonomous Drosophila neural & endocrine simulation with a 3D anatomy viewport.",
+  "scripts": {
+    "dev": "python3 run.py --host 0.0.0.0 --port 8777 --no-window",
+    "build": "node -e \"const fs=require('fs');fs.cpSync('web','dist',{recursive:true});console.log('static assets staged: web/ -> dist/')\"",
+    "start": "python3 run.py --host 0.0.0.0 --port ${PORT:-8777} --no-window",
+    "preview": "python3 run.py --host 0.0.0.0 --port ${PORT:-8777} --no-window"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^5.4.11"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

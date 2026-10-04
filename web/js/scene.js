@@ -16,6 +16,144 @@ import * as THREE from '../vendor/three.module.js';
 import { buildFly } from './fly.js';
 import { buildEnvironment, buildStimulus, updateStimulus, disposeGroup } from './world.js';
 
+/**
+ * A tiny radiance source that stands in for the room.
+ *
+ * Nothing in the scene was acting as an environment map, so every metalness and
+ * transmission surface — the fly's cuticle, the sink, the petri dish — was resolving
+ * its specular term against pure black and reading as flat paint. A PMREM built from a
+ * few emissive quads gives those materials something to reflect: a bright ceiling, a
+ * warm floor bounce, and a coloured rim matching the environment. It costs one
+ * cubemap render at load and is regenerated whenever the environment changes.
+ */
+function buildEnvironmentProbe() {
+  const probe = new THREE.Scene();
+  const add = (color, intensity, w, h, d, x, y, z, rx, ry) => {
+    const mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(w, h, d),
+      new THREE.MeshBasicMaterial({ color: new THREE.Color(color).multiplyScalar(intensity) }),
+    );
+    mesh.position.set(x, y, z);
+    mesh.rotation.set(rx, ry, 0);
+    probe.add(mesh);
+  };
+
+  // Ceiling — the dominant source, and what a horizontal surface actually mirrors.
+  // Kept dim on purpose: the probe's job is specular reflection, not lighting. A
+  // bright probe becomes a giant area light and washes every diffuse surface out,
+  // so the analytic lights still own the exposure and this only adds the reflection
+  // that analytic lights cannot provide.
+  add(0xdfeaff, 0.9, 60, 1, 60, 0, 24, 0);
+  // Floor bounce, warm and dim, so undersides are not dead black.
+  add(0x4a3a2c, 0.22, 60, 1, 60, 0, -24, 0);
+  // Two side walls break up the reflection so curved surfaces show a gradient
+  // instead of one flat value across their whole length.
+  add(0x8fa8c8, 0.34, 1, 44, 60, -26, 2, 0);
+  add(0x6a7fa0, 0.26, 1, 44, 60, 26, 2, 0);
+  // A warm accent behind the camera, which is what gives the fly's eye and thorax
+  // their highlight as it turns.
+  add(0xffd9a0, 0.55, 40, 26, 1, 0, 4, -26);
+  return probe;
+}
+
+/**
+ * Sky dome: a vertical gradient plus a sun disc, drawn on the inside of a box.
+ *
+ * The environment's ``skybox`` field is a single flat colour, which reads as a void
+ * behind every arena. This turns it into an actual sky: the given colour becomes the
+ * horizon, the zenith is derived from it and pushed cooler and darker, and a soft
+ * sun sits where the key light comes from. It costs one shader on a box that the
+ * camera never leaves.
+ */
+function buildSky(spec, sunDirection) {
+  const horizon = new THREE.Color(spec.skybox || '#0b1220');
+  const zenith = horizon.clone();
+  {
+    // Pull the horizon colour toward a deep blue at altitude: interiors want a dark
+    // ceiling, exteriors want a lighter one, and both want less saturation up top.
+    //
+    // The hue is moved *toward* a target rather than rotated by a fixed amount. A
+    // fixed rotation only looks right for warm horizons — add the same 0.52 to a warm
+    // brown and you land on blue, which is what you want, but add it to an already
+    // blue sky and you land on yellow-green, which is a bug that only shows up in the
+    // two environments whose skybox is blue.
+    const hsl = { h: 0, s: 0, l: 0 };
+    zenith.getHSL(hsl);
+    const TARGET_HUE = 0.58;                      // blue
+    let delta = TARGET_HUE - hsl.h;
+    if (delta > 0.5) delta -= 1;                  // take the short way round the wheel
+    if (delta < -0.5) delta += 1;
+    zenith.setHSL(
+      (hsl.h + delta * 0.75 + 1) % 1,            // most of the way to blue, not all of it
+      Math.min(0.8, hsl.s * 0.85 + 0.10),
+      Math.max(0.04, hsl.l * 0.5),
+    );
+  }
+  const ground = horizon.clone().multiplyScalar(0.35);
+
+  const material = new THREE.ShaderMaterial({
+    side: THREE.BackSide,
+    depthWrite: false,
+    fog: false,
+    uniforms: {
+      uZenith: { value: zenith },
+      uHorizon: { value: horizon },
+      uGround: { value: ground },
+      uSun: { value: sunDirection.clone().normalize() },
+      uSunColor: { value: new THREE.Color(0xfff2d8) },
+      uSunIntensity: { value: Math.max(0, Math.min(1.4, (spec.ambientLight ?? 0.6) * 1.15)) },
+    },
+    vertexShader: /* glsl */`
+      precision highp float;
+      varying vec3 vDir;
+      void main() {
+        vDir = normalize(position);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */`
+      // A ShaderMaterial gets no default float precision, so without this every
+      // varying and local below is an untyped float and the program will not link.
+      precision highp float;
+      varying vec3 vDir;
+      uniform vec3 uZenith;
+      uniform vec3 uHorizon;
+      uniform vec3 uGround;
+      uniform vec3 uSun;
+      uniform vec3 uSunColor;
+      uniform float uSunIntensity;
+
+      void main() {
+        vec3 dir = normalize(vDir);
+        float h = dir.y;
+        // Above the horizon: horizon -> zenith. Below: horizon -> dark ground.
+        vec3 sky = mix(uHorizon, uZenith, pow(clamp(h, 0.0, 1.0), 0.55));
+        vec3 below = mix(uHorizon, uGround, pow(clamp(-h, 0.0, 1.0), 0.45));
+        vec3 color = h > 0.0 ? sky : below;
+
+        // Sun disc with a wide halo. The halo is what sells it as atmosphere; a hard
+        // disc alone just looks like a bright pixel.
+        float cosAngle = dot(dir, normalize(uSun));
+        float halo = pow(clamp(cosAngle, 0.0, 1.0), 220.0);
+        float glow = pow(clamp(cosAngle, 0.0, 1.0), 8.0) * 0.22;
+        color += uSunColor * (halo * 2.4 + glow) * uSunIntensity;
+
+        // A soft band right at the horizon keeps the two halves from meeting in a
+        // hard line, which is the giveaway of a gradient sky on a box.
+        color += uHorizon * 0.35 * exp(-abs(h) * 14.0);
+
+        gl_FragColor = vec4(color, 1.0);
+      }
+    `,
+  });
+
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(2, 2, 2), material);
+  mesh.frustumCulled = false;
+  mesh.renderOrder = -1000;
+  mesh.scale.setScalar(1200);
+  return mesh;
+}
+
 export const CAMERA_MODES = [
   { key: 'follow', label: 'Follow', blurb: 'Third-person orbit locked to the fly with damping' },
   { key: 'tactical', label: 'Tactical room', blurb: 'Free-look overhead view for managing the arena' },
@@ -44,6 +182,9 @@ const COMPOSITE_FRAG = /* glsl */`
   uniform float uFlowStrength;
   uniform float uFacets;
   uniform float uTime;
+  uniform sampler2D tAO;         // ambient occlusion, half resolution
+  uniform float uAOStrength;
+  uniform float uAberration;
 
   // -- helpers ---------------------------------------------------------------
   float linearDepth(vec2 uv) {
@@ -56,6 +197,32 @@ const COMPOSITE_FRAG = /* glsl */`
   vec3 aces(vec3 x) {
     // Narkowicz's ACES fit: cheap, and it keeps highlights from clipping to white.
     return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+  }
+
+  /**
+   * Split one channel off to the side of the optical axis.
+   *
+   * Real optics do not focus every wavelength to the same point, so a bright rim
+   * fringes blue on one side and red on the other. Sampling R, G and B at slightly
+   * different radial offsets costs three fetches instead of one and is the whole
+   * effect; the magnitude is driven by distance from centre so the middle of the
+   * frame stays perfectly sharp, which is where the fly usually is.
+   */
+  vec3 chroma(vec2 uv, vec2 texel) {
+    // Two extra fetches only buy the fringe at the edges of the frame, where the
+    // aberration offset is largest. Near the centre the three samples are within a
+    // fraction of a texel of each other, so the single-fetch path is not an
+    // approximation — it is the same answer for a third of the bandwidth.
+    vec2 centred = uv - 0.5;
+    float radial = length(centred) * 2.0;
+    if (uAberration < 0.01 || radial < 0.25) return texture2D(tScene, uv).rgb;
+
+    vec2 shift = centred * uAberration * 0.012;
+    vec3 c;
+    c.r = texture2D(tScene, uv + shift).r;
+    c.g = texture2D(tScene, uv).g;
+    c.b = texture2D(tScene, uv - shift).b;
+    return c;
   }
 
   vec3 linearToSrgb(vec3 c) {
@@ -141,22 +308,38 @@ const COMPOSITE_FRAG = /* glsl */`
       float coc = clamp(abs(depth - uFocusDist) / max(1.0, uFocusDist) * uAperture, 0.0, 1.0);
       float radius = coc * 2.6 / uResolution.x;
 
-      vec3 sharp = texture2D(tScene, uv).rgb;
-      // A 12-tap disc: cheap and, at these radii, indistinguishable from a proper
-      // golden-angle spiral for a soft background.
-      vec3 blurred = vec3(0.0);
-      float total = 0.0;
-      for (int i = 0; i < 12; i++) {
-        float angle = float(i) * 2.39996;
-        float ring = sqrt(float(i) / 12.0);
-        vec2 offset = vec2(cos(angle), sin(angle)) * ring * (radius * uResolution.x);
-        vec2 tap = clamp(uv + offset / uResolution, 0.001, 0.999);
-        float weight = 1.0 / (1.0 + abs(linearDepth(tap) - depth) * 0.05);
-        blurred += texture2D(tScene, tap).rgb * weight;
-        total += weight;
+      vec3 sharp = chroma(uv, 1.0 / uResolution);
+      vec3 scene = sharp;
+
+      // The blur is only mixed in where there is any circle of confusion at all.
+      // Most of the frame is in focus, and skipping the whole 12-tap disc for those
+      // warps is the difference between a smooth frame rate and a slow one. The
+      // threshold is well below the first visible step of the mix so the transition
+      // stays invisible.
+      float blurMix = smoothstep(0.0, 0.55, coc);
+      if (uAperture > 0.001 && blurMix > 0.002) {
+        // A 12-tap disc: cheap and, at these radii, indistinguishable from a proper
+        // golden-angle spiral for a soft background.
+        vec3 blurred = vec3(0.0);
+        float total = 0.0;
+        for (int i = 0; i < 12; i++) {
+          float angle = float(i) * 2.39996;
+          float ring = sqrt(float(i) / 12.0);
+          vec2 offset = vec2(cos(angle), sin(angle)) * ring * (radius * uResolution.x);
+          vec2 tap = clamp(uv + offset / uResolution, 0.001, 0.999);
+          float weight = 1.0 / (1.0 + abs(linearDepth(tap) - depth) * 0.05);
+          blurred += texture2D(tScene, tap).rgb * weight;
+          total += weight;
+        }
+        blurred /= max(0.0001, total);
+        scene = mix(sharp, blurred, blurMix);
       }
-      blurred /= max(0.0001, total);
-      vec3 scene = mix(sharp, blurred, smoothstep(0.0, 0.55, coc));
+
+      // Ambient occlusion darkens contact points: the crease where a leg meets the
+      // body, the ring where a fruit sits in the bowl, the fly's own shadow pooling
+      // under it. Without it everything floats.
+      float ao = texture2D(tAO, uv).r;
+      scene *= mix(1.0, ao, uAOStrength);
 
       // Two bloom scales: a tight core plus a wide halo. One scale alone either
       // looks like a smudge or like nothing happened.
@@ -171,8 +354,13 @@ const COMPOSITE_FRAG = /* glsl */`
     // Vignette and grain apply to both views; they sell the sensor.
     float vig = 1.0 - uVignette * dot((uv - 0.5) * vec2(1.1, 1.0), (uv - 0.5) * vec2(1.1, 1.0)) * 3.2;
     color *= clamp(vig, 0.0, 1.0);
+
+    // Grain is strongest in the shadows. Uniform noise reads as digital sensor
+    // noise and flattens the midtones; film noise is densest where the signal is
+    // weakest, so the weighting follows the inverted luma.
+    float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
     float grain = (hash(uv * uResolution + fract(uTime) * 91.7) - 0.5) * uGrain;
-    color += grain;
+    color += grain * mix(1.8, 0.35, smoothstep(0.0, 0.55, luma));
 
     gl_FragColor = vec4(color, 1.0);
   }
@@ -208,6 +396,133 @@ const BLUR_FRAG = /* glsl */`
       sum += texture2D(tInput, vUv - offset).rgb * weights[i];
     }
     gl_FragColor = vec4(sum, 1.0);
+  }
+`;
+
+/**
+ * Screen-space ambient occlusion from the depth buffer alone.
+ *
+ * There is no G-buffer here — the post chain deliberately renders a single forward
+ * target — so the surface normal is reconstructed per pixel from the depth texture by
+ * central differences, and the hemisphere is sampled around it. That is enough for
+ * contact darkening, which is all AO is doing in this scene.
+ *
+ * The kernel is a fixed 12-tap golden-angle spiral with a per-pixel rotation. The
+ * rotation is what turns banding into noise, and the blur pass afterwards turns the
+ * noise back into a smooth gradient — the standard interleaved-graphics trick, and the
+ * reason this can run at half resolution without showing it.
+ */
+const AO_FRAG = /* glsl */`
+  precision highp float;
+  varying vec2 vUv;
+
+  uniform sampler2D tDepth;
+  uniform vec2  uResolution;    // AO buffer resolution, not the scene's
+  uniform float uNear;
+  uniform float uFar;
+  uniform float uRadius;        // world-space radius of the hemisphere
+  uniform float uBias;
+  uniform float uTime;
+  uniform float uFovTan;        // tan(verticalFov / 2)
+  uniform float uAspect;
+
+  float linearDepth(vec2 uv) {
+    float z = texture2D(tDepth, uv).x;
+    if (z >= 1.0) return uFar;
+    float ndc = z * 2.0 - 1.0;
+    return (2.0 * uNear * uFar) / (uFar + uNear - ndc * (uFar - uNear));
+  }
+
+  /**
+   * View-space position for a depth sample.
+   *
+   * The tangent is rebuilt from the projection's field of view rather than passed in
+   * as a matrix, because the tangent of the half-angle is the only quantity the
+   * hemisphere maths needs and one divide per pixel is cheaper than a mat4 multiply.
+   */
+  vec3 viewPosition(vec2 uv, float depth) {
+    // View-space position rebuilt from the projection's tan(fov/2). Shipping
+    // tan-half-angle and aspect costs two floats; shipping the inverse projection
+    // matrix would cost four and buy nothing this pass uses.
+    vec2 ndc = uv * 2.0 - 1.0;
+    return vec3(ndc.x * depth * uFovTan * uAspect, ndc.y * depth * uFovTan, -depth);
+  }
+
+  float hash12(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+  }
+
+  void main() {
+    float depth = linearDepth(vUv);
+    // Sky, and anything past the far plane, cannot be occluded by anything.
+    if (depth >= uFar * 0.999) { gl_FragColor = vec4(1.0); return; }
+
+    // Reconstruct the normal from neighbouring depth. A one-texel offset is too
+    // small to survive float precision on a scene 2000 units deep, so the step is
+    // scaled with resolution and clamped.
+    vec2 texel = 1.0 / uResolution;
+    float dL = linearDepth(vUv - vec2(texel.x, 0.0));
+    float dR = linearDepth(vUv + vec2(texel.x, 0.0));
+    float dD = linearDepth(vUv - vec2(0.0, texel.y));
+    float dU = linearDepth(vUv + vec2(0.0, texel.y));
+
+    vec3 pL = viewPosition(vUv - vec2(texel.x, 0.0), dL);
+    vec3 pR = viewPosition(vUv + vec2(texel.x, 0.0), dR);
+    vec3 pD = viewPosition(vUv - vec2(0.0, texel.y), dD);
+    vec3 pU = viewPosition(vUv + vec2(0.0, texel.y), dU);
+
+    // Degenerate where depth is identical on both sides — a flat surface seen
+    // edge-on, or the far plane — leaves the cross product at zero, and normalizing
+    // that yields NaN which would then propagate through every downstream tap. The
+    // comparison is a length test rather than isnan(), which GLSL ES 1.00 does not
+    // have; NaN fails every comparison and so also falls through to the same branch.
+    vec3 cross1 = cross(pR - pL, pU - pD);
+    float crossLen = length(cross1);
+    if (!(crossLen > 1e-8)) { gl_FragColor = vec4(1.0); return; }
+    vec3 normal = cross1 / crossLen;
+
+    // Per-pixel rotation, animated slowly so the residual noise crawls instead of
+    // sitting still as a fixed dither pattern.
+    float angle = hash12(gl_FragCoord.xy + fract(uTime) * 37.0) * 6.2831853;
+
+    // Build a basis around the normal so the spiral lies in a hemisphere above it.
+    vec3 up = abs(normal.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+    vec3 tangent = normalize(cross(up, normal));
+    vec3 bitangent = cross(normal, tangent);
+
+    vec3 origin = viewPosition(vUv, depth);
+    float occlusion = 0.0;
+
+    for (int i = 0; i < 8; i++) {
+      float fi = float(i);
+      // Golden-angle spiral: even coverage of the disc with no visible structure.
+      // Eight taps is one fewer third of the AO cost; because the result is
+      // half-resolution and then blurred, the difference against twelve taps is not
+      // visible, while the saving is spent on resolution instead.
+      float a = fi * 2.39996 + angle;
+      float r = sqrt((fi + 0.5) / 8.0);
+      vec3 dir = tangent * cos(a) * r + bitangent * sin(a) * r + normal * (0.35 + 0.55 * (1.0 - r));
+      vec3 samplePos = origin + dir * uRadius;
+
+      // Project the sample back to screen and read the depth actually stored there.
+      // If the surface is *closer* than the sample, something else is in the way.
+      vec2 suv = vec2(
+        (samplePos.x / max(1e-4, -samplePos.z)) / (uFovTan * uAspect),
+        (samplePos.y / max(1e-4, -samplePos.z)) / uFovTan
+      ) * 0.5 + 0.5;
+
+      if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) continue;
+
+      float sceneDepth = linearDepth(suv);
+      float rangeWeight = 1.0 - smoothstep(0.0, 1.0, abs(depth - sceneDepth) / uRadius);
+      float delta = depth - sceneDepth;
+      occlusion += step(uBias, delta) * rangeWeight;
+    }
+
+    float ao = 1.0 - (occlusion / 8.0);
+    gl_FragColor = vec4(ao, ao, ao, 1.0);
   }
 `;
 
@@ -292,6 +607,7 @@ export class Viewport {
       stencil: false,
     });
     this.pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    this.renderScale = 1;
     this.renderer.setPixelRatio(1);
     this.renderer.shadowMap.enabled = true;
     // PCFSoftShadowMap was removed in r186; PCFShadowMap is the supported soft filter.
@@ -318,11 +634,22 @@ export class Viewport {
     this.sun.shadow.camera.far = 2600;
     this.sun.shadow.bias = -0.0012;
     this.sun.shadow.normalBias = 0.6;
-    this.sun.shadow.camera.left = -700;
-    this.sun.shadow.camera.right = 700;
-    this.sun.shadow.camera.top = 700;
-    this.sun.shadow.camera.bottom = -700;
-    this.scene.add(this.hemi, this.sun, this.sun.target);
+    // The shadow frustum is retargeted onto the fly every frame in follow mode, so it
+    // only ever has to cover a small patch of ground rather than the whole arena. That
+    // buys the resolution back: at 2048 across 1400 units a texel spans 0.7 units and
+    // the fly's own shadow is one texel wide, which is why nothing was casting.
+    this.sun.shadow.camera.left = -70;
+    this.sun.shadow.camera.right = 70;
+    this.sun.shadow.camera.top = 70;
+    this.sun.shadow.camera.bottom = -70;
+    this.sunTarget = new THREE.Vector3(0, 0, 0);
+    // Offset from the shadow target to the light. Recomputed per environment in
+    // setEnvironment; the default here is what the first frame uses if an
+    // environment has not loaded yet.
+    this.sunOffset = new THREE.Vector3(320, 620, 260);
+    this.shadowSpan = 70;
+    this.scene.add(this.sun.target);
+    this.scene.add(this.hemi, this.sun);
 
     this.fill = new THREE.PointLight(0xbcd4ff, 0.5, 2400, 2.0);
     this.fill.position.set(-360, 320, -260);
@@ -332,6 +659,61 @@ export class Viewport {
     // standard camera's near plane would clip the fly's own body.
     this.flyLight = new THREE.PointLight(0xffffff, 0.0, 120, 2.0);
     this.scene.add(this.flyLight);
+
+    // Image-based lighting. Without this every metalness > 0 surface has nothing to
+    // reflect and renders as flat paint — the sink, the drain, the fly's cuticle and
+    // its eyes all lose their form. The probe is a handful of emissive quads, so the
+    // whole map costs one 128px cubemap render.
+    this.pmrem = new THREE.PMREMGenerator(this.renderer);
+    this.probeScene = buildEnvironmentProbe();
+    const probeTarget = this.pmrem.fromScene(this.probeScene, 0.04);
+    this.scene.environment = probeTarget.texture;
+    this.scene.environmentIntensity = 0.75;
+
+    this.sky = null;
+  }
+
+  /**
+   * Rebuild the sky dome and re-tint the environment probe for a new arena.
+   *
+   * The probe is regenerated rather than tinted in place because PMREM textures are
+   * prefiltered: changing the source colour afterwards would leave the roughness
+   * mips stale. Regenerating costs a fraction of a millisecond and only happens when
+   * the environment actually changes.
+   */
+  _rebuildSky(spec) {
+    if (this.sky) {
+      this.scene.remove(this.sky);
+      this.sky.geometry.dispose();
+      this.sky.material.dispose();
+    }
+    this.sky = buildSky(spec, this.sun.position);
+    this.scene.add(this.sky);
+
+    const light = spec.ambientLight ?? 0.6;
+    // Retint the probe's emissive quads toward the environment's own colour so the
+    // reflections agree with the sky the player can actually see. The multipliers
+    // stay well below 1: this modulates a reflection, not the exposure.
+    const tint = new THREE.Color(spec.skybox || '#0b1220');
+    const levels = [0.55 + 0.5 * light, 0.5, 0.5 + 0.3 * light, 0.45 + 0.25 * light, 0.5 + 0.4 * light];
+    const meshes = this.probeScene.children;
+    for (let index = 0; index < meshes.length; index++) {
+      const base = meshes[index].userData.baseColor;
+      if (!base) {
+        meshes[index].userData.baseColor = meshes[index].material.color.clone();
+      }
+      const color = meshes[index].userData.baseColor.clone();
+      // A cool sky pulls reflections blue; a warm interior pulls them amber. Mixing
+      // toward the environment colour by 35% is enough to read without flattening.
+      color.lerp(tint, 0.35);
+      color.multiplyScalar(levels[index] ?? 1);
+      meshes[index].material.color.copy(color);
+    }
+    const previous = this.scene.environment;
+    const target = this.pmrem.fromScene(this.probeScene, 0.04);
+    this.scene.environment = target.texture;
+    if (previous) previous.dispose();
+    this.scene.environmentIntensity = 0.5 + 0.5 * light;
   }
 
   _initPost() {
@@ -362,6 +744,22 @@ export class Viewport {
     this.bloomScratch = [0, 1, 2].map((index) => {
       const dims = mipSize(index);
       return new THREE.WebGLRenderTarget(dims.width, dims.height, { type: THREE.HalfFloatType });
+    });
+
+    // Ambient occlusion runs at half resolution and is blurred before use. AO is a
+    // low-frequency signal by construction — nothing about a contact crease needs
+    // full-res detail — so half-res costs a quarter of the work and is invisible.
+    const aoWidth = Math.max(2, size.width >> 1);
+    const aoHeight = Math.max(2, size.height >> 1);
+    this.aoTarget = new THREE.WebGLRenderTarget(aoWidth, aoHeight, {
+      type: THREE.UnsignedByteType,
+      depthBuffer: false,
+      stencilBuffer: false,
+    });
+    this.aoBlurTarget = new THREE.WebGLRenderTarget(aoWidth, aoHeight, {
+      type: THREE.UnsignedByteType,
+      depthBuffer: false,
+      stencilBuffer: false,
     });
 
     this.quad = new THREE.Mesh(fullscreenGeometry(), null);
@@ -396,6 +794,9 @@ export class Viewport {
         uFlowStrength: { value: 0 },
         uFacets: { value: 78 },
         uTime: { value: 0 },
+        tAO: { value: this.aoTarget.texture },
+        uAOStrength: { value: 0.85 },
+        uAberration: { value: 0.7 },
       },
     });
 
@@ -409,6 +810,26 @@ export class Viewport {
       uniforms: {
         tScene: { value: this.sceneTarget.texture },
         uThreshold: { value: 0.72 },
+      },
+    });
+
+    this.aoMaterial = new THREE.RawShaderMaterial({
+      vertexShader: `precision highp float;
+        attribute vec3 position; attribute vec2 uv; varying vec2 vUv;
+        void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+      fragmentShader: AO_FRAG,
+      depthTest: false,
+      depthWrite: false,
+      uniforms: {
+        tDepth: { value: this.sceneTarget.depthTexture },
+        uResolution: { value: new THREE.Vector2(aoWidth, aoHeight) },
+        uNear: { value: 2 },
+        uFar: { value: 4000 },
+        uRadius: { value: 14 },
+        uBias: { value: 0.9 },
+        uTime: { value: 0 },
+        uFovTan: { value: Math.tan((52 * Math.PI) / 360) },
+        uAspect: { value: 1 },
       },
     });
 
@@ -427,8 +848,12 @@ export class Viewport {
   }
 
   _targetSize() {
-    const width = Math.max(2, Math.floor(this.canvas.clientWidth * this.pixelRatio));
-    const height = Math.max(2, Math.floor(this.canvas.clientHeight * this.pixelRatio));
+    // The canvas is sized in device pixels for the CSS box, then scaled by the
+    // adaptive quality factor. Clamped to 2 so a 3x display does not quietly triple
+    // the cost of every pass.
+    const ratio = Math.min(this.pixelRatio * (this.renderScale ?? 1), 2);
+    const width = Math.max(2, Math.floor(this.canvas.clientWidth * ratio));
+    const height = Math.max(2, Math.floor(this.canvas.clientHeight * ratio));
     return { width, height };
   }
 
@@ -441,17 +866,22 @@ export class Viewport {
     this.environmentGroup = built.group;
     this.solids = built.solids;
 
-    this.scene.background = new THREE.Color(spec.skybox || '#0b1220');
+    this.scene.background = null;   // the sky dome draws the background now
     // The density in the environment table is authored for a fly's-eye view; how it
     // is applied across zoom levels is decided per frame in render().
     this.fogBase = spec.fog ?? 0.0006;
-    this.scene.fog = new THREE.FogExp2(spec.skybox || '#0b1220', this.fogBase);
+    const horizon = new THREE.Color(spec.skybox || '#0b1220');
+    this.scene.fog = new THREE.FogExp2(horizon, this.fogBase);
 
     const light = spec.ambientLight ?? 0.6;
     this.hemi.intensity = 0.22 + 0.5 * light;
     this.sun.intensity = 0.25 + 1.9 * light;
     this.sun.position.set(spec.size[0] * 0.35, spec.size[1] * 1.4, spec.size[2] * 0.45);
     this.fill.intensity = 0.25 + 0.5 * light;
+    this.sunOffset = new THREE.Vector3(
+      spec.size[0] * 0.35, spec.size[1] * 1.4, spec.size[2] * 0.45,
+    );
+    this._rebuildSky(spec);
 
     this.environment = spec;
     this.orbit.tactical.distance = Math.max(spec.size[0], spec.size[2]) * 1.15;
@@ -701,6 +1131,9 @@ export class Viewport {
     const { width, height } = this._targetSize();
     if (this.canvas.width !== width || this.canvas.height !== height) this.resize();
 
+    // Keep the sky centred on the camera so it never runs into the far plane.
+    if (this.sky) this.sky.position.copy(this.camera.position);
+
     // Exponential-squared fog is authored for a fly's-eye view. From the tactical
     // camera roughly a thousand units away, the same density leaves barely half the
     // scene unfogged and the room collapses into a near-black smear, so the density
@@ -719,6 +1152,36 @@ export class Viewport {
     uniforms.uFocusDist.value = flyVision ? 30 : Math.max(12, this.orbit.distance * 0.85);
     uniforms.uAperture.value = flyVision ? 0 : (this.cameraMode === 'tactical' ? 0.22 : 0.75);
 
+    // Retarget the shadow frustum. In follow and fly-vision the subject is the fly, so
+    // the frustum tracks it and stays small. The tactical camera sees the whole arena,
+    // so it has to pull back out or the room simply loses its shadows.
+    if (primary && this.cameraMode !== 'tactical') {
+      this.sunTarget.set(primary.position[0], primary.position[1], primary.position[2]);
+    } else {
+      this.sunTarget.copy(this.orbit.target);
+    }
+    const shadowSpan = this.cameraMode === 'tactical'
+      ? Math.max(this.environment ? this.environment.size[0] : 900, this.environment ? this.environment.size[2] : 600) * 0.75
+      : 70;
+    if (Math.abs(shadowSpan - (this.shadowSpan || 0)) > 1) {
+      this.shadowSpan = shadowSpan;
+      const camera = this.sun.shadow.camera;
+      camera.left = -shadowSpan;
+      camera.right = shadowSpan;
+      camera.top = shadowSpan;
+      camera.bottom = -shadowSpan;
+      camera.updateProjectionMatrix();
+    }
+    // The key light keeps its authored direction but follows the subject, so the
+    // shadow direction on the ground stays constant as the fly moves across the room.
+    this.sun.target.position.copy(this.sunTarget);
+    this.sun.position.set(
+      this.sunTarget.x + this.sunOffset.x,
+      this.sunTarget.y + this.sunOffset.y,
+      this.sunTarget.z + this.sunOffset.z,
+    );
+    this.sun.target.updateMatrixWorld();
+
     // Optical flow hint: the fly's own velocity projected into screen space.
     if (primary) {
       const speed = Math.min(1, (primary.speed || 0) / 400);
@@ -733,6 +1196,7 @@ export class Viewport {
     this.renderer.render(this.scene, this.camera);
 
     if (!flyVision) {
+      this._ambientOcclusion();
       this._bloom();
       uniforms.tBloom.value = this.bloomTargets[0].texture;
       uniforms.tBloomWide.value = this.bloomTargets[2].texture;
@@ -741,6 +1205,76 @@ export class Viewport {
     this.renderer.setRenderTarget(null);
     this.quad.material = this.compositeMaterial;
     this.renderer.render(this.quadScene, this.quadCamera);
+
+    this._adapt(dt);
+  }
+
+  /**
+   * Screen-space AO, then a separable blur across it.
+   *
+   * The blur is not optional: the per-pixel kernel rotation that removes the AO's
+   * banding turns the leftover error into noise, and a single separable pass over a
+   * half-res buffer is what turns that noise back into a smooth gradient.
+   */
+  _ambientOcclusion() {
+    const uniforms = this.aoMaterial.uniforms;
+    uniforms.tDepth.value = this.sceneTarget.depthTexture;
+    uniforms.uNear.value = this.camera.near;
+    uniforms.uFar.value = this.camera.far;
+    uniforms.uTime.value = this.clock.elapsedTime;
+    uniforms.uFovTan.value = Math.tan((this.camera.fov * Math.PI) / 360);
+    uniforms.uAspect.value = this.camera.aspect;
+    // Scale the sampling radius with how far away the ground is. A fixed world radius
+    // either misses the fly entirely from the tactical camera or swallows the whole
+    // scene up close, so it tracks the orbit distance instead.
+    uniforms.uRadius.value = Math.max(4, Math.min(90, this.orbit.distance * 0.28));
+
+    this.quad.material = this.aoMaterial;
+    this.renderer.setRenderTarget(this.aoTarget);
+    this.renderer.render(this.quadScene, this.quadCamera);
+
+    this.quad.material = this.blurMaterial;
+    this.blurMaterial.uniforms.tInput.value = this.aoTarget.texture;
+    this.blurMaterial.uniforms.uDirection.value.set(1 / this.aoTarget.width, 0);
+    this.renderer.setRenderTarget(this.aoBlurTarget);
+    this.renderer.render(this.quadScene, this.quadCamera);
+
+    this.blurMaterial.uniforms.tInput.value = this.aoBlurTarget.texture;
+    this.blurMaterial.uniforms.uDirection.value.set(0, 1 / this.aoTarget.height);
+    this.renderer.setRenderTarget(this.aoTarget);
+    this.renderer.render(this.quadScene, this.quadCamera);
+
+    this.compositeMaterial.uniforms.tAO.value = this.aoTarget.texture;
+  }
+
+  /**
+   * Hold the frame budget by trading resolution.
+   *
+   * AO and the existing bloom chain add real per-pixel cost, and the machine this runs
+   * on varies. Rather than pick one fixed quality and hope, the renderer measures its
+   * own frame time and nudges the internal resolution between 55% and 100% of the
+   * device pixel ratio. The changes are small and hysteretic so it settles instead of
+   * oscillating, and the canvas is CSS-sized so the layout never moves.
+   */
+  _adapt(dt) {
+    this._frameAccum = (this._frameAccum || 0) + dt;
+    this._frameCount = (this._frameCount || 0) + 1;
+    if (this._frameCount < 24) return;
+
+    const average = this._frameAccum / this._frameCount;
+    this._frameAccum = 0;
+    this._frameCount = 0;
+
+    const scale = this.renderScale;
+    let next = scale;
+    if (average > 0.024 && scale > 0.55) next = Math.max(0.55, scale - 0.1);
+    else if (average < 0.0135 && scale < 1) next = Math.min(1, scale + 0.05);
+
+    if (Math.abs(next - scale) > 0.001) {
+      this.renderScale = next;
+      this.resize();
+      if (this.onQualityChange) this.onQualityChange(next);
+    }
   }
 
   _bloom() {
@@ -794,6 +1328,11 @@ export class Viewport {
       this.bloomTargets[index].setSize(mipWidth, mipHeight);
       this.bloomScratch[index].setSize(mipWidth, mipHeight);
     }
+    const aoWidth = Math.max(2, width >> 1);
+    const aoHeight = Math.max(2, height >> 1);
+    this.aoTarget.setSize(aoWidth, aoHeight);
+    this.aoBlurTarget.setSize(aoWidth, aoHeight);
+    this.aoMaterial.uniforms.uResolution.value.set(aoWidth, aoHeight);
     this.compositeMaterial.uniforms.uResolution.value.set(width, height);
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
@@ -805,5 +1344,15 @@ export class Viewport {
     if (name === 'grain') uniforms.uGrain.value = value;
     if (name === 'vignette') uniforms.uVignette.value = value;
     if (name === 'exposure') uniforms.uExposure.value = value;
+    if (name === 'ao') uniforms.uAOStrength.value = value;
+    if (name === 'aberration') uniforms.uAberration.value = value;
+  }
+
+  /** Freeze the adaptive resolution controller, e.g. when the user picks a preset. */
+  setRenderScale(scale) {
+    this.renderScale = Math.max(0.5, Math.min(1, scale));
+    this._frameAccum = 0;
+    this._frameCount = 0;
+    this.resize();
   }
 }
